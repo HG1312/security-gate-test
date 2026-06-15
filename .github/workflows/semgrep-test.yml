@@ -1,0 +1,34 @@
+name: Semgrep Rules Test
+
+# Runs on pull requests, and you can also trigger it by hand from the
+# Actions tab (the "Run workflow" button) thanks to workflow_dispatch.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  semgrep:
+    name: Semgrep (semgrep-rules - Python + JS)
+    runs-on: ubuntu-latest
+    # The official Semgrep image. It already has semgrep and git installed.
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      # Pull the rules straight from the official repo you chose.
+      - name: Download semgrep-rules
+        run: git clone --depth 1 https://github.com/semgrep/semgrep-rules.git /tmp/semgrep-rules
+
+      # Scan using only the Python, JavaScript and TypeScript rule folders.
+      # --error makes the job fail (red check) if anything is found.
+      # --verbose prints every finding so you can read them in the logs.
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config /tmp/semgrep-rules/python \
+            --config /tmp/semgrep-rules/javascript \
+            --config /tmp/semgrep-rules/typescript \
+            --error \
+            --verbose
