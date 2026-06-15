@@ -1,124 +1,144 @@
-// Vulnerable Node.js demo - EXPANDED with harder cases.
-// Every block below is a real vulnerability class. Some are simple one-line
-// patterns; others hide the bug behind helper functions and data flow, to
-// test how well Semgrep tracks tainted input. Comments mark the difficulty.
-// Nothing here is real or safe. Do not run it.
+// Vulnerable Node.js demo - COMPLEX edition.
+// This mimics real production code: classes, async/await, Express middleware,
+// data passed through objects/arrays, and a sanitizer that does NOT actually
+// sanitize. The bugs are hidden behind layers on purpose, to test whether the
+// scanner can follow tainted input through indirection, not just one-liners.
+// Nothing here is safe. Do not run it.
 
 const express = require("express");
-const { exec, execSync } = require("child_process");
+const { exec } = require("child_process");
 const fs = require("fs");
-const crypto = require("crypto");
-const http = require("http");
-const jwt = require("jsonwebtoken");
+const path = require("path");
+const axios = require("axios");
 const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// 1. COMMAND INJECTION hidden behind TWO helper functions (needs dataflow).
-//    Tainted input travels: route -> buildCmd() -> runner() -> execSync().
-//    This is the HARD one. A simple pattern matcher sees execSync(cmd) and
-//    cannot tell cmd came from the user. Real taint tracking can.
+// A "sanitizer" that looks protective but only trims whitespace. Tainted data
+// stays tainted after this. Tests whether the scanner is fooled by the name.
 // ---------------------------------------------------------------------------
-function runner(cmd) {
-  return execSync(cmd).toString();
+function sanitize(input) {
+  return String(input).trim();
 }
-function buildCmd(host) {
-  return "nslookup " + host;
-}
-app.get("/lookup", (req, res) => {
-  const host = req.query.host;   // attacker controlled
-  const cmd = buildCmd(host);    // passes through a builder
-  res.send(runner(cmd));         // ...and a runner before execSync
-});
 
-// ---------------------------------------------------------------------------
-// 2. PATH TRAVERSAL - file read with user input (../../etc/passwd).
-// ---------------------------------------------------------------------------
-app.get("/download", (req, res) => {
-  const file = req.query.name;
-  const data = fs.readFileSync("/var/data/" + file);
-  res.send(data);
-});
-
-// ---------------------------------------------------------------------------
-// 3. SSRF - the server fetches a URL the user controls.
-// ---------------------------------------------------------------------------
-app.get("/fetch", (req, res) => {
-  http.get(req.query.url, (r) => {
-    r.pipe(res);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 4. NoSQL injection - raw request body straight into a Mongo query.
-//    {"$ne": null} in the password field bypasses the check.
-// ---------------------------------------------------------------------------
-app.post("/login", (req, res) => {
-  db.collection("users").findOne({
-    username: req.body.username,
-    password: req.body.password,
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 5. WEAK CRYPTO - MD5 used to hash passwords.
-// ---------------------------------------------------------------------------
-function hashPassword(pw) {
-  return crypto.createHash("md5").update(pw).digest("hex");
+// Generic deep-merge helper (classic prototype-pollution sink).
+function merge(target, source) {
+  for (const key in source) {
+    if (typeof source[key] === "object" && source[key] !== null) {
+      target[key] = merge(target[key] || {}, source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
 }
 
 // ---------------------------------------------------------------------------
-// 6. INSECURE RANDOMNESS - Math.random used to make a security token.
+// 1. MIDDLEWARE TAINT. User input is stashed on the request object here, then
+//    consumed by a handler much later. The taint crosses functions via req.
 // ---------------------------------------------------------------------------
-function makeToken() {
-  return Math.random().toString(36).slice(2);
+app.use((req, res, next) => {
+  req.ctx = { rawPath: req.query.path, rawHost: req.query.host };
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// A service class. The dangerous sink (exec) is a private-ish method, reached
+// only through a chain: handler -> runDiagnostic -> buildOptions -> execute.
+// ---------------------------------------------------------------------------
+class OpsService {
+  constructor() {
+    this.prefix = "ping -c 1 ";
+  }
+
+  execute(opts) {
+    // Sink. opts.command originates from user input several hops back.
+    return new Promise((resolve, reject) => {
+      exec(opts.command, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+    });
+  }
+
+  buildOptions(target) {
+    const cleaned = sanitize(target); // looks safe, is not
+    return { command: this.prefix + cleaned, timeout: 5000 };
+  }
+
+  async runDiagnostic(target) {
+    const opts = this.buildOptions(target);
+    return this.execute(opts);
+  }
 }
 
-// ---------------------------------------------------------------------------
-// 7. HARDCODED SECRET used to sign JWTs.
-// ---------------------------------------------------------------------------
-const JWT_SECRET = "s3cr3t-signing-key-do-not-commit";
-function sign(user) {
-  return jwt.sign({ user }, JWT_SECRET);
+const ops = new OpsService();
+
+// 2. COMMAND INJECTION through the class chain + a fake sanitizer (hard).
+app.get("/diag", async (req, res) => {
+  const out = await ops.runDiagnostic(req.ctx.rawHost);
+  res.send(out);
+});
+
+// 3. PATH TRAVERSAL where the path travels through middleware, an array, and
+//    path.join before reaching fs (hard, multi-hop through a data structure).
+app.get("/read", (req, res) => {
+  const segments = ["/srv/files", req.ctx.rawPath];
+  const full = path.join(...segments);
+  fs.readFile(full, "utf8", (err, data) => res.send(data));
+});
+
+// 4. SSRF behind async/await and a helper.
+async function fetchRemote(url) {
+  const resp = await axios.get(url);
+  return resp.data;
 }
-
-// ---------------------------------------------------------------------------
-// 8. OPEN REDIRECT - redirect target is user controlled.
-// ---------------------------------------------------------------------------
-app.get("/go", (req, res) => {
-  res.redirect(req.query.next);
+app.post("/proxy", async (req, res) => {
+  const body = req.body;
+  const data = await fetchRemote(body.target); // user-controlled URL
+  res.json(data);
 });
 
-// ---------------------------------------------------------------------------
-// 9. INSECURE DESERIALIZATION via the Function constructor (eval cousin).
-// ---------------------------------------------------------------------------
-app.post("/run", (req, res) => {
-  const fn = new Function("return " + req.body.code);
-  res.send(String(fn()));
+// 5. INSECURE DESERIALIZATION. JSON parsed, a field pulled out, then run
+//    through the Function constructor inside a callback.
+app.post("/exec-rule", (req, res) => {
+  const parsed = JSON.parse(req.body.rule);
+  const handlers = {
+    run: (expr) => new Function("ctx", "return " + expr),
+  };
+  const fn = handlers.run(parsed.expression);
+  res.send(String(fn({})));
 });
 
-// ---------------------------------------------------------------------------
-// 10. REFLECTED XSS - user input written straight into the HTML response.
-// ---------------------------------------------------------------------------
-app.get("/hello", (req, res) => {
-  res.send("<h1>Hello " + req.query.name + "</h1>");
+// 6. PROTOTYPE POLLUTION. Raw body deep-merged into an object.
+app.post("/config", (req, res) => {
+  const config = {};
+  merge(config, req.body);
+  res.json(config);
 });
 
-// ---------------------------------------------------------------------------
-// 11. CLASSIC eval (simple one-line pattern, easy baseline).
-// ---------------------------------------------------------------------------
-app.get("/calc", (req, res) => {
-  res.send(String(eval(req.query.expr)));
+// 7. DYNAMIC REQUIRE driven by user input (arbitrary module load).
+app.get("/plugin", (req, res) => {
+  const mod = require(req.query.name);
+  res.send(typeof mod);
 });
 
-// ---------------------------------------------------------------------------
-// 12. SQL INJECTION by string concatenation.
-// ---------------------------------------------------------------------------
-app.get("/user", (req, res) => {
-  const query = "SELECT * FROM users WHERE id = '" + req.query.id + "'";
-  db.query(query, (err, rows) => {
-    res.json(rows);
-  });
+// 8. SQL INJECTION where input passes through the fake sanitizer first, and
+//    the query is built with a template literal across two functions.
+function buildUserQuery(id) {
+  const safeish = sanitize(id);
+  return `SELECT * FROM users WHERE id = '${safeish}'`;
+}
+app.get("/account", (req, res) => {
+  const q = buildUserQuery(req.query.id);
+  db.query(q, (err, rows) => res.json(rows));
+});
+
+// 9. COMMAND INJECTION via template literal, conditional path (only on a flag).
+app.get("/log", (req, res) => {
+  const branch = req.query.branch || "main";
+  if (req.query.verbose) {
+    exec(`git log ${branch} --stat`, (e, out) => res.send(out));
+  } else {
+    res.send("ok");
+  }
 });
 
 app.listen(3000);
